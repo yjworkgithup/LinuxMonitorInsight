@@ -1,0 +1,2 @@
+# LinuxMonitorInsight
+  SSH agentless
