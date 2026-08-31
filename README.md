@@ -1,6 +1,136 @@
 # LinuxMonitorInsight
   SSH agentless
 
+---
+
+## The Five Planes of LinuxMonitorInsight
+
+### 1. Collection Plane (采集平面)
+
+The data ingestion layer responsible for pulling metrics from remote nodes via SSH.
+
+| Concept | Description |
+|---------|-------------|
+| **Heartbeat Timestamp / Node Time** | Wall-clock timestamp when the last successful collection occurred. Used to compute staleness and drive the `fresh → stale → timeout` ladder. |
+| **Lagrangian Theorem** | Time is measured in the node's reference frame, not the observer's. The heartbeat timestamp is the node's "last known alive" event; observer lag is accounted for separately. |
+| **Lipschitz Continuity** | Resource metrics (CPU, memory, load) are assumed to be Lipschitz-continuous: bounded rate of change between samples. Violations indicate either measurement noise or true anomaly. |
+| **Signal / Semaphore / Pool / Concurrency** | `MAX_CONCURRENT` bounds in-flight SSH operations. `asyncio.Semaphore` gates access. Connection pool recycles sockets to avoid FD exhaustion. |
+| **Data Age** | `now - last_successful_collect_ts`. Drives the stale-check watchdog. |
+
+---
+
+### 2. Channel Plane (通道平面)
+
+The transport layer health monitoring, separating "can I reach the node" from "is the node dead."
+
+| Concept | Description |
+|---------|-------------|
+| **ConnSick (`_conn_health`)** | Cluster-level connection health tracker. When `fail_ratio ≥ 0.5`, the channel is declared sick. All node-side evidence is frozen — no guilt by association. |
+| **Connection Pool Transfusion** | Aggressive pool recycling: connections older than `POOL_MAX_AGE_SEC` are marked `pending_close`. Prevents stale socket accumulation. |
+| **Three-Level Circuit Breaker** | `IndustrialCircuitBreaker` with hysteresis, observation window, and flapping detection. Trip threshold ≠ reset threshold (asymmetric). |
+| **Jitter** | Randomized backoff added to reconnection attempts to prevent thundering herd after mass recovery. |
+
+---
+
+### 3. Control Plane (控制平面)
+
+The governance layer that regulates resource usage under pressure.
+
+| Concept | Description |
+|---------|-------------|
+| **Backpressure** | When `observer_health.loop_lag` exceeds threshold, the capacity governor reduces `MAX_CONCURRENT` and extends collection timeouts. |
+| **Adaptive Governor** | `CapacityGovernor` with dual-mode logic: `safety` mode (cliff — any degradation halves capacity) vs. `efficiency` mode (slope — only true failure waves trigger reduction). |
+| **Fuse / Circuit Breaker** | Three independent breakers: global (cluster-level), node-level (per-IP), and half-open (probe exit gating). |
+| **Peak Shaving / Shedding** | When capacity is exceeded, excess nodes are `SHED` — counted but not collected. Shed count is booked to `total_suppressed` for conservation law compliance. |
+| **Sharding** | Nodes partitioned into `SHARD_COUNT` shards. Each shard has independent collection cycle, failure tracking, and flush loop. |
+| **Bypass Detection** | Audit grep for `asyncssh.connect` outside `HandshakeArbiter.acquire()` — any direct connection is a constitutional violation. |
+
+---
+
+### 4. Epistemic Plane (认识平面)
+
+The state machine that reasons about what we know, what we don't know, and what we can claim.
+
+| Concept | Description |
+|---------|-------------|
+| **State Ladder** | `fresh → stale → timeout → unknown → offline`. Each rung is a verdict with a specific burden of evidence. No skipping allowed. |
+| **Confidence / Evidence Strength** | `compute_confidence()` returns `[0, 1]` based on RTT stability, sample count, and prediction error. Below `EVIDENCE_FLOOR = 0.3`, failure scores do not participate in control decisions. |
+| **Heartbeat Latency** | Round-trip time of SSH command execution. Fed into EWMA for trend detection and anomaly scoring. |
+| **Exponential Backoff** | `NODE_COOLDOWN_BASE * (COOLDOWN_BACKOFF_FACTOR ** exponent)`, capped at `NODE_COOLDOWN_MAX` (300s) or `PHANTOM_COOLDOWN_MAX` (1h) for never-successful nodes. |
+| **Warm-up** | `IndustrialDigitalTwin` uses SMA for first `warm_up_samples` before switching to EWMA. Prevents early wild predictions. |
+| **Bulkhead Mode** | `HandshakeArbiter` enforces single-queue admission for new handshakes. Pre-connections, main-path reconnections, and batch SSH share one physical gate. |
+
+---
+
+### 5. Interaction Plane (交互平面)
+
+The human-facing and machine-facing output layers.
+
+| Concept | Description |
+|---------|-------------|
+| **Main Path vs. Batch SSH** | Main path: core collection loop. Batch SSH: ad-hoc command execution. Each has dedicated semaphore quota to prevent mutual starvation. |
+| **Job Query Temp Pool** | `cluster_MS` (job scheduling channel) runs in separate process. Observer holds cross-process admission valve (`[FEAT-VALVE-001]`). |
+| **LLM Advisor Interpretation** | Time-series data fed to LLM for natural-language anomaly explanation. Not just "CPU 100%" but "CPU spike correlates with D-state IO storm, likely NFS deadlock." |
+| **Web + Qt Dual Frontend** | Web: heatmap + WebSocket push. Qt Desktop: native table + signal-slot. Both consume same `_node_results_buffer`. |
+
+---
+
+## The Three Resource Domains
+
+| Domain | Metrics | Controls |
+|--------|---------|----------|
+| **Time** | Heartbeat timestamp, data age, RTT, wall-clock constants | Stale-check interval, timeout thresholds, observation windows |
+| **Resources** | RSS, GFLOPS, semaphore value, pool size, concurrency count | Capacity governor, backpressure, shedding |
+| **Stability** | Exponential backoff, warm-up samples, bulkhead isolation, three-level fuse, jitter | `IndustrialCircuitBreaker`, `CapacityGovernor`, `HandshakeArbiter` |
+
+---
+
+## Quality Metrics
+
+| Metric | Definition | Target |
+|--------|-----------|--------|
+| **Confidence** | Prediction reliability score | > 0.3 for control participation |
+| **Heartbeat Latency** | SSH command RTT | < 15s normal, < 7.5s degraded |
+| **Data Age** | `now - last_collect_ts` | < 90s for ONLINE |
+| **Pool Transfusion Rate** | Connections recycled per minute | Sufficient to prevent FD exhaustion |
+
+---
+
+## Isolation Patterns
+
+| Pattern | Implementation | Purpose |
+|---------|---------------|---------|
+| **Main Path** | Core collection loop with `MAX_CONCURRENT` | Steady-state monitoring |
+| **Batch SSH** | `batch_sem` quota within `HandshakeArbiter` | Ad-hoc commands without starving main path |
+| **Job Query Temp Pool** | Separate process (`cluster_MS`) | Job scheduling isolation |
+| **Bulkhead Mode** | Single `HandshakeArbiter` gate | Prevent resource exhaustion from any single source |
+
+---
+
+## Control Mechanisms
+
+| Mechanism | Trigger | Action |
+|-----------|---------|--------|
+| **Backpressure** | Observer loop lag > threshold | Reduce concurrency, extend timeout |
+| **Adaptive** | Load trend via `IndustrialDigitalTwin` | Adjust governor parameters |
+| **Fuse / Breaker** | Error rate > trip threshold | Open circuit, shed load |
+| **Peak Shaving** | Capacity exceeded | Shed excess nodes, book to `total_suppressed` |
+| **Sharding** | Node count > shard threshold | Partition into independent collection shards |
+| **Bypass Detection** | Direct `asyncssh.connect` found | Log constitutional violation |
+
+---
+
+## Explanation Layer
+
+| Feature | Input | Output |
+|---------|-------|--------|
+| **LLM Advisor** | Time-series metrics + state transitions | Natural-language anomaly diagnosis |
+| **Digital Twin** | Historical observations | Trend, volatility, anomaly score, prediction |
+| **Self-Audit** | `precision@horizon`, false-positive rate | Monthly report on monitor health |
+
+---
+
+This architecture treats monitoring not as "data collection" but as **epistemic engineering**: every state transition is a claim with a burden of proof, every constant has a derivation, and the system knows when it does not know.
 
 # LinuxMonitorInsight
 
